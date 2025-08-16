@@ -15,38 +15,33 @@ import seaborn as sns
 from seqeval.metrics import classification_report
 from sklearn.metrics import cohen_kappa_score
 
-
-SPACY_LABEL_MAP = {
-    'O': 'O',
-    'PERSON': 'PERSON',
-    'BUSINESS': 'ORG',
-    'GOVERNMENT': 'ORG',
-    'LEGISLATION/ACT': 'LAW',
-    'LOCATION': 'GPE',
-    'LOC': 'GPE',
-    'MISCELLANEOUS': 'MISC',
-    'COURT': 'ORG',
-    'P': 'O'
-}
-
-TRANSFORMER_LABEL_MAP = {
+GT_LABEL_MAP = {
     'O': 'O',
     'PERSON': 'PER',
     'BUSINESS': 'ORG',
     'GOVERNMENT': 'ORG',
     'LEGISLATION/ACT': 'LAW',
-    'LOCATION': 'LOC',
     'LOC': 'LOC',
+    'LOCATION': 'LOC',
     'MISCELLANEOUS': 'MISC',
     'COURT': 'ORG',
     'P': 'O'
+}
+
+MODEL_LABEL_MAP = {
+    "PERSON": "PER",
+    "ORG": "ORG",
+    "GPE": "LOC",
+    "LOC": "LOC",
+    "PER": "PER",
+    "LAW": "LAW",
+    "MISC": "MISC"
 }
 
 
 BENCHMARK_MODELS = {
     "XML-RoBERTa": "Davlan/xlm-roberta-base-ner-hrl",
     "BERT-Davlan": "Davlan/bert-base-multilingual-cased-ner-hrl",
-    "Legal-BERT": "nlpaueb/legal-bert-base-uncased",
     "spaCy": "en_core_web_sm"
 }
 
@@ -56,25 +51,26 @@ def inference_report(true_tags_all, pred_tags_all):
 
     kappa_global = cohen_kappa_score(true_tags_flat, pred_tags_flat)
 
-    entity_types = set(tag for tag in true_tags_flat if tag != 'O')
+    entity_types = set(tag.split('-')[-1] for tag in true_tags_flat if tag != 'O')
 
     kappa_per_type = {}
     for entity in entity_types:
-        y_true = [1 if t == entity else 0 for t in true_tags_flat]
-        y_pred = [1 if p == entity else 0 for p in pred_tags_flat]
+        y_true = [1 if entity in t else 0 for t in true_tags_flat]
+        y_pred = [1 if entity in p else 0 for p in pred_tags_flat]
         kappa_per_type[entity] = cohen_kappa_score(y_true, y_pred)
 
     print(set(true_tags_flat))
     print(set(pred_tags_flat))
     seqeval_report = classification_report(true_tags_all, pred_tags_all, output_dict=True)
 
-    for key in seqeval_report:
-        if isinstance(seqeval_report[key], dict):
-            for subkey in seqeval_report[key]:
-                if isinstance(seqeval_report[key][subkey], (np.float32, np.float64)):
-                    seqeval_report[key][subkey] = float(seqeval_report[key][subkey])
+    # converting values to int and float to avoid error while saving json
+    for key, value in seqeval_report.items():
+        if isinstance(value, dict):
+            for subkey, subvalue in value.items():
+                if isinstance(subvalue, (np.float32, np.float64)):
+                    seqeval_report[key][subkey] = float(subvalue)
                 elif isinstance(seqeval_report[key][subkey], (np.int32, np.int64)):
-                    seqeval_report[key][subkey] = int(seqeval_report[key][subkey])
+                    seqeval_report[key][subkey] = int(subvalue)
 
     metrics = {
         'seqeval': seqeval_report,
@@ -86,11 +82,7 @@ def inference_report(true_tags_all, pred_tags_all):
 
     return metrics
 
-def plot_report(results, dataset_name="E-NER Dataset"):
-    if not results:
-        print("No results to plot")
-        return
-
+def plot_report(results, dataset_name='E-NER Dataset'):
     plot_data = []
     for model_name, metrics in results.items():
         seqeval = metrics['seqeval']
@@ -158,19 +150,16 @@ def plot_report(results, dataset_name="E-NER Dataset"):
     plt.ylim(0, 1)
 
     plt.tight_layout()
-    plt.savefig('./teste.png')
+    timestamp = datetime.now()
+    timestamp = timestamp.strftime('%d-%m-%y_%H-%M-%S')
+    plt.savefig('./experiments/plot_'+timestamp+'.png')
 
-def save_experiment_report(model, exp_time, inference_report, path='./experiments/'):
+def save_experiment_report(inference_report, path='./experiments/'):
     timestamp = datetime.now()
     timestamp = timestamp.strftime('%d-%m-%y_%H-%M-%S')
 
-    exp_report = {'model': model,
-                  'inference_time': exp_time,
-                  'inference_report': inference_report
-                  }
-
-    with open(path+model+'_'+timestamp, 'w') as f:
-        json.dump(exp_report, f)
+    with open(path+'inference_report_'+timestamp, 'w') as f:
+        json.dump(inference_report, f)
 
 def spacy_ner(text: str, model):
     doc = model(text)
@@ -197,91 +186,89 @@ def transformers_ner(text: str, pipeline):
 
     return entities
 
-def convert_to_word_level(doc_df, pred_entities, model):
-    if model == 'spaCy':
-        feature_map = SPACY_LABEL_MAP
-    else:
-        feature_map = TRANSFORMER_LABEL_MAP
-
+def convert_to_word_level(doc_df, pred_entities):
     words = doc_df.iloc[:, 0].tolist()
-    true_tags = [feature_map[i] for i in doc_df.iloc[:, 1].tolist()]
-    text = ' '.join(words)
+    true_tags = doc_df.iloc[:, 1].tolist()
+
     word_offsets = []
     pos = 0
-
     for word in words:
         word_offsets.append((pos, pos + len(word)))
-        pos += len(word) + 1
+        pos += len(word) + 1 # space
 
     pred_tags = ['O'] * len(words)
 
     for entity in pred_entities:
         entity_start = entity['start']
         entity_end = entity['end']
-        entity_label = entity['label']
+        entity_label = MODEL_LABEL_MAP.get(entity['label'], 'O')
 
         # find which words are covered by this entity
         covered_words = []
         for i, (start, end) in enumerate(word_offsets):
             if not (end <= entity_start or start >= entity_end):
                 covered_words.append(i)
-
+        
+        # apply IOB2 format
         if covered_words:
-            for i in covered_words:
-                pred_tags[i] = entity_label
+            first_word = covered_words[0]
+            pred_tags[first_word] = 'B-' + entity_label
+
+            for i in covered_words[1:]:
+                pred_tags[i] = 'I-' + entity_label
 
     return true_tags, pred_tags
 
-def benchmark_models(docs, eval_docs):
+def benchmark_models(eval_docs, models):
     results = {}
 
-    for model_name, model_path in BENCHMARK_MODELS.items():
+    for model_name, model_path in models.items():
         print(f'Benchmarking {model_name}')
 
         true_tags_all = []
         pred_tags_all = []
 
-        if model_name == 'spaCy':
+        if 'spacy' in model_name.lower():
             model = spacy.load(model_path)
-
             start = time()
-            for doc_df in eval_docs:
+
+            for doc_df in tqdm(eval_docs, desc=f'Evaluating {model_name}'):
                 words = doc_df.iloc[:, 0].tolist()
-                text = " ".join(words)
-
+                text = ' '.join(words)
                 preds = spacy_ner(text, model)
-
-                true_tags, pred_tags = convert_to_word_level(doc_df, preds, 'spaCy')
+                
+                true_tags, pred_tags = convert_to_word_level(doc_df, preds)
                 true_tags_all.append(true_tags)
                 pred_tags_all.append(pred_tags)
             exp_time = time() - start
 
         else:
+            print(model_path)
             tokenizer = AutoTokenizer.from_pretrained(model_path)
             model = AutoModelForTokenClassification.from_pretrained(model_path)
             ner_pipeline = pipeline(
-                "ner",
+                'ner',
                 model=model,
                 tokenizer=tokenizer,
-                aggregation_strategy="simple",
+                aggregation_strategy='simple',
                 device=0 if torch.cuda.is_available() else -1
             )
 
             start = time()
-            for doc_df in eval_docs:
+            for doc_df in tqdm(eval_docs, desc=f'Evaluanting {model_name}'):
                 words = doc_df.iloc[:, 0].tolist()
-                text = " ".join(words)
-
+                text = ' '.join(words)
                 preds = transformers_ner(text, ner_pipeline)
 
-                true_tags, pred_tags = convert_to_word_level(doc_df, preds, model_name)
+                true_tags, pred_tags = convert_to_word_level(doc_df, preds)
                 true_tags_all.append(true_tags)
                 pred_tags_all.append(pred_tags)
             exp_time = time() - start
         
-        results[model_name] = inference_report(true_tags_all, pred_tags_all)
-        results[model_name]['inference_time'] = exp_time
-        print(results)
+        report = inference_report(true_tags_all, pred_tags_all)
+        report['inference_time'] = exp_time
+        results[model_name] = report
+
         print(f"Results for {model_name}:")
         print(json.dumps(results[model_name], indent=2))
 
@@ -292,43 +279,52 @@ def prepare_spacy_training_data(docs_df):
     for doc_df in docs_df:
         words = doc_df.iloc[:, 0].tolist()
         tags = doc_df.iloc[:, 1].tolist()
-
+        text = ' '.join(words)
         entities = []
-        current_entity = None
+        current_label = ''
+        entity_start_char = -1
+        char_idx = 0
 
-        for i, (word, tag) in enumerate(zip(words, tags)):
-            if tag != 'O':
-                if current_entity and current_entity['label'] == SPACY_LABEL_MAP.get(tag, 'O'):
-                    current_entity['end'] = i+1
-                else:
-                    if current_entity:
-                        entities.append(current_entity)
-                    current_entity = {
-                        'start': i,
-                        'end': i+1,
-                        'label': SPACY_LABEL_MAP.get(tag, 'O')
-                    }
-            else:
-                if current_entity:
-                    entities.append(current_entity)
-                    current_entity = None
+        for i, word in enumerate(words):
+            tag = tags[i]
+            
+            if tag.startswith('B-'):
+                if entity_start_char != -1:
+                    entity_end_char = char_idx - 1
+                    entities.append((entity_start_char, entity_end_char, current_label))
+                entity_start_char = char_idx
+                current_label = tag.split('-', 1)[1]
 
-        if current_entity:
-            entities.append(current_entity)
+            elif tag.startswith('I-'):
+                label = tag.split('-', 1)[1]
+                if label != current_label or entity_start_char == -1:
+                    if entity_start_char != -1:
+                        entity_end_char = char_idx - 1
+                        entities.append((entity_start_char, entity_end_char, current_label))
+                    entity_start_char = -1
+            
+            else: # tag is 'O'
+                if entity_start_char != -1:
+                    entity_end_char = char_idx - 1
+                    entities.append((entity_start_char, entity_end_char, current_label))
+                entity_start_char = -1
+                current_label = ''
+                
+            char_idx += len(word) + 1
 
-        training_data.append((' '.join(words), {'entities': entities}))
+        if entity_start_char != -1:
+            entity_end_char = char_idx - 1
+            entities.append((entity_start_char, entity_end_char, current_label))
+            
+        training_data.append((text, {'entities': entities}))
 
     return training_data
 
-def train_spacy_model(docs_df, n_iter=10):
+def train_spacy_model(docs_df, n_iter=10, output_path='./models/spacy_finetuned'):
     nlp = spacy.blank("en")
+    ner = nlp.add_pipe("ner")
 
-    if "ner" not in nlp.pipe_names:
-        ner = nlp.add_pipe("ner")
-    else:
-        ner = nlp.get_pipe("ner")
-
-    for label in set(SPACY_LABEL_MAP.values()):
+    for label in set(GT_LABEL_MAP.values()):
         if label != 'O':
             ner.add_label(label)
 
@@ -338,29 +334,32 @@ def train_spacy_model(docs_df, n_iter=10):
     with nlp.disable_pipes(*other_pipes):
         optimizer = nlp.begin_training()
 
-        for itn in range(n_iter):
+        print("--- Starting spaCy Model Training ---")
+        for it in range(n_iter):
             losses = {}
             random.shuffle(training_data)
 
-            for text, annotations in tqdm(training_data):
+            for text, annotations in tqdm(training_data, desc=f'Iteration {it+1}/{n_iter}'):
                 example = Example.from_dict(nlp.make_doc(text), annotations)
-                nlp.update([example], drop=0.5, losses=losses)
+                nlp.update([example],drop=0.5, losses=losses)
 
-            print(f"Iteration {itn}, Losses: {losses}")
+    if output_path:
+        nlp.to_disk(output_path)
 
     return nlp
-"""
-def pepare_tranformer_training_data(docs_df):
-    feature_map = TRANSFORMER_LABEL_MAP
-    labels = feature_map.values()
+
+def create_transformer_label_maps():
+    gt_labels = set(GT_LABEL_MAP.values()) - {'O'}
+    labels = ['O'] + [f'B-{t}' for t in gt_labels] + [f'I-{t}' for t in gt_labels]
+    id2label = {i: label for i, label in enumerate(labels)}
     label2id = {label: i for i, label in enumerate(labels)}
+    return id2label, label2id
 
+def prepare_transformer_training_data(docs_df, label2id):
     data = {'tokens': [], 'ner_tags': []}
-
     for doc_df in docs_df:
-        words = doc_df.iloc[:, 0].tolist()
-        tags = doc_df.iloc[:, 1].tolist()
-        tag_ids = [label2id[feature_map[tag]] for tag in tags]
+        words = doc_df['token'].tolist()
+        tag_ids = [label2id[tag] for tag in doc_df['tag'].tolist()]
 
         data['tokens'].append(words)
         data['ner_tags'].append(tag_ids)
@@ -383,7 +382,7 @@ def tokenize_and_align_labels(examples, tokenizer):
         label_ids = []
         for word_idx in word_ids:
             if word_idx is None:
-                label_ids.append(-100)
+                label_ids.append(-100) # ignore special tokens
             elif word_idx != previous_word_idx:
                 label_ids.append(label[word_idx])
             else:
@@ -394,23 +393,23 @@ def tokenize_and_align_labels(examples, tokenizer):
     tokenized_inputs["labels"] = labels
     return tokenized_inputs
 
-def train_legalbert_model(docs_df, n_epochs=3):
-    tokenizer = BertTokenizerFast.from_pretrained('nlpaueb/legal-bert-base-uncased')
+def train_transformer_model(
+    docs_df,
+    model_checkpoint='nlpaueb/legal-bert-base-uncased',
+    n_epochs=3,
+    output_dir='./transformer_finetuned_model'
+):
+    id2label, label2id = create_transformer_label_maps()
+    tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
     
-    label_list = set(TRANSFORMER_LABEL_MAP.values())
-    id2label = {i: label for i, label in enumerate(label_list)}
-    label2id = {label: i for i, label in enumerate(label_list)}
-    print(label2id)
-    
-    model = BertForTokenClassification.from_pretrained(
-        'nlpaueb/legal-bert-base-uncased',
-        num_labels=len(label_list),
+    model = AutoModelForTokenClassification.from_pretrained(
+        model_checkpoint,
+        num_labels=len(id2label),
         id2label=id2label,
         label2id=label2id
     )
     
-    dataset = prepare_legalbert_training_data(docs_df)
-    
+    dataset = prepare_transformer_training_data(docs_df, label2id)
     tokenized_dataset = dataset.map(
         lambda examples: tokenize_and_align_labels(examples, tokenizer),
         batched=True,
@@ -418,94 +417,95 @@ def train_legalbert_model(docs_df, n_epochs=3):
     )
     
     training_args = TrainingArguments(
-        output_dir='./legalbert-ner',
-        eval_strategy='epoch',
+        output_dir=output_dir,
         learning_rate=2e-5,
         per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
         num_train_epochs=n_epochs,
         weight_decay=0.01,
-        save_strategy='epoch',
         logging_dir='./logs',
+        logging_steps=10,
+        save_strategy='epoch',
     )
     
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset,
-        eval_dataset=tokenized_dataset,
         tokenizer=tokenizer,
     )
     
+    print(f'--- Starting Transformer ({model_checkpoint}) Fine-Tuning ---')
     trainer.train()
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f'Transformer model saved to {output_dir}')
     return model, tokenizer
-"""
+
+def map_label(tag):
+    if not isinstance(tag, str) or tag in ['O', '']:
+        return 'O'
+    
+    parts = tag.split('-')
+    prefix = parts[0]
+    label_type = '-'.join(parts[1:]) if len(parts) > 1 else parts[0]
+    
+    mapped_type = GT_LABEL_MAP.get(label_type)
+    
+    if not mapped_type or mapped_type == 'O':
+        return 'O'
+    
+    if prefix in ['B', 'I']:
+        return f"{prefix}-{mapped_type}"
+    else:
+        return f"B-{mapped_type}"
 
 def load_e_ner(path: str):
-    df = pd.read_csv(path).fillna('')
-    df.iloc[:,1] = df.iloc[:,1].apply(lambda x: x.split('-')[-1])
-    split_idx = df.index[df.iloc[:,0] == '-DOCSTART-'].to_list()
+    df = pd.read_csv(path, names=['token', 'tag']).fillna('')
+    df['tag'] = df['tag'].apply(map_label)
+    
+    split_idx = df.index[df['token'] == '-DOCSTART-'].tolist()
+    
+    # Create a list of DataFrames, one for each document
     list_dfs = [df.iloc[split_idx[i]+1:split_idx[i+1]].reset_index(drop=True) for i in range(len(split_idx)-1)]
+        
     return list_dfs
-
-"""
-def process_e_ner(docs, model):
-    texts = [' '.join(doc.iloc[:, 0]) for doc in docs]
-    entities, exp_time = entity_recognition(model, texts)
-    return entities, exp_time
-
-def eval_e_ner(model, docs_df, doc_entities):
-    all_true = []
-    all_pred = []
-
-    for doc_df, preds in zip(docs_df, doc_entities):
-        true_tags, pred_tags = convert_to_word_level(doc_df, preds, model)
-        all_true.append(true_tags)
-        all_pred.append(pred_tags)
-
-    # filter documents with no entities
-    filtered_true = []
-    filtered_pred = []
-    for t, p in zip(all_true, all_pred):
-        if any(tag != 'O' for tag in t) or any(tag != 'O' for tag in p):
-            filtered_true.append(t)
-            filtered_pred.append(p)
-
-    return inference_report(filtered_true, filtered_pred)
-"""
 
 if __name__ == '__main__':
     path = './data/E-NER-Dataset/all.csv'
     docs = load_e_ner(path)
-    train_docs = docs[:46]
-    eval_docs = docs[46:]
+    split_point = int(len(docs) * 0.8)
+    train_docs = docs[:split_point]
+    eval_docs = docs[split_point:]
 
+    print(f"Loaded {len(docs)} documents.")
+    print(f"Training set size: {len(train_docs)}")
+    print(f"Evaluation set size: {len(eval_docs)}\n")
+    
+    # train spacy model
     """
-    for model in ['legalBERT', 'spacy'][:1]:
-        print(f"Training {model} model...")
+    spacy_finetuned_path = './models/spacy_finetuned'
+    train_spacy_model(train_docs, n_iter=300, output_path=spacy_finetuned_path)
+    BENCHMARK_MODELS['spacy-finetuned'] = spacy_finetuned_path
+    
+    # fine-tune Legal-BERT model
+    legalbert_finetuned_path = "./models/legalbert_finetuned"
+    train_transformer_model(
+        train_docs,
+        model_checkpoint="nlpaueb/legal-bert-base-uncased",
+        n_epochs=300,
+        output_dir=legalbert_finetuned_path
+    )
+    BENCHMARK_MODELS['LegalBERT-Finetuned'] = legalbert_finetuned_path
 
-        if model == 'spacy':
-            nlp = train_spacy_model(train_docs, n_iter=3)
-            nlp.to_disk(f"./{model}_trained_model")
-        elif model == 'legalBERT':
-            model_bert, tokenizer = train_legalbert_model(train_docs, n_epochs=1)
-            model_bert.save_pretrained(f"./{model}_trained_model")
-            tokenizer.save_pretrained(f"./{model}_tokenizer")
-
-        print(f'{model}: Evaluation')
-        if model == 'spacy':
-            nlp = spacy.load(f"./{model}_trained_model")
-        elif model == 'legalBERT':
-            ner = pipeline('ner',
-                         model=f"./{model}_trained_model",
-                         tokenizer=f"./{model}_trained_model",
-                         aggregation_strategy='simple')
-
-        entities, exp_time = process_e_ner(eval_docs, model)
-        results = eval_e_ner(model, eval_docs, entities)
-        print(json.dumps(results, indent=2))
-        save_experiment_report(model, exp_time, results)
+    timestamp = datetime.now()
+    timestamp = timestamp.strftime('%d-%m-%y_%H-%M-%S')
+    with open('benchmark_checkpoint_'+timestamp+'.json', 'w') as f:
+        json.dump(BENCHMARK_MODELS, f)
     """
+    with open('benchmark_checkpoint_16-08-25_00-16-42.json') as f:
+        BENCHMARK_MODELS = json.load(f)
 
-    benchmark_results = benchmark_models(train_docs, eval_docs)
+    print(f"Evaluation set size: {len(eval_docs)}")
+    benchmark_results = benchmark_models(eval_docs, BENCHMARK_MODELS)
+    save_experiment_report(benchmark_results)
     plot_report(benchmark_results)
